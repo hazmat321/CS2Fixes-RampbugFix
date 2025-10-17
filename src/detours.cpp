@@ -38,7 +38,6 @@
 
 #include <cmath>
 
-
 #define VPROF_ENABLED
 #include "tier0/vprof.h"
 
@@ -54,6 +53,107 @@ DECLARE_DETOUR(ProcessMovement, Detour_ProcessMovement);
 DECLARE_DETOUR(TryPlayerMove, Detour_TryPlayerMove);
 DECLARE_DETOUR(CategorizePosition, Detour_CategorizePosition);
 
+// --------------------------------------------------------------------------------------
+// Legacy acceleration integration (inline, no extra files)
+// --------------------------------------------------------------------------------------
+struct LegacyAccelParams
+{
+	float sv_accelerate = 5.5f;    // tune to pre-update values
+	float sv_airaccelerate = 12.0f;
+	float sv_friction = 4.0f;
+	float sv_stopspeed = 75.0f;
+	float airspeed_cap = 30.0f;    // classic Source airspeed cap
+	bool  enable = true;           // master toggle
+};
+
+static LegacyAccelParams g_LegacyAccelParams {};
+
+static inline void Legacy_ApplyFriction(const LegacyAccelParams& p, float dt, Vector& vel)
+{
+	float speed = vel.Length2D();
+	if (speed <= 0.0f) return;
+
+	float control = speed < p.sv_stopspeed ? p.sv_stopspeed : speed;
+	float drop = control * p.sv_friction * dt;
+
+	float newSpeed = speed - drop;
+	if (newSpeed < 0.0f) newSpeed = 0.0f;
+	if (newSpeed != speed)
+	{
+		float scale = (speed > 0.0f) ? (newSpeed / speed) : 0.0f;
+		vel.x *= scale;
+		vel.y *= scale;
+		// leave vel.z untouched here
+	}
+}
+
+static inline void Legacy_AccelerateGround(const LegacyAccelParams& p, float dt, const Vector& wishdir, float wishspeed, Vector& velXY)
+{
+	float currentSpeed = DotProduct(velXY, wishdir);
+	float addSpeed = wishspeed - currentSpeed;
+	if (addSpeed <= 0.0f) return;
+
+	float accelSpeed = p.sv_accelerate * wishspeed * dt;
+	if (accelSpeed > addSpeed) accelSpeed = addSpeed;
+
+	velXY.x += wishdir.x * accelSpeed;
+	velXY.y += wishdir.y * accelSpeed;
+}
+
+static inline void Legacy_AccelerateAir(const LegacyAccelParams& p, float dt, const Vector& wishdir, float wishspeed, Vector& velXY)
+{
+	// Classic Source cap
+	if (wishspeed > p.airspeed_cap)
+		wishspeed = p.airspeed_cap;
+
+	float currentSpeed = DotProduct(velXY, wishdir);
+	float addSpeed = wishspeed - currentSpeed;
+	if (addSpeed <= 0.0f) return;
+
+	float accelSpeed = p.sv_airaccelerate * wishspeed * dt;
+	if (accelSpeed > addSpeed) accelSpeed = addSpeed;
+
+	velXY.x += wishdir.x * accelSpeed;
+	velXY.y += wishdir.y * accelSpeed;
+}
+
+// Computes a legacy acceleration/friction step using mv->m_outWishVel.
+// - inOutVel: read current velocity; writes the legacy X/Y result (Z preserved by caller)
+static inline void ComputeLegacyVelocityStep(CCSPlayer_MovementServices* ms, CMoveData* mv, const LegacyAccelParams& params, Vector& inOutVel)
+{
+	if (!params.enable || !gpGlobals || !mv) return;
+
+	const float dt = gpGlobals->frametime > 0.f ? gpGlobals->frametime : (1.f / 64.f);
+
+	// Use engine-provided wish vector for this subtick.
+	Vector wish = mv->m_outWishVel;
+	float wishspeed = wish.Length2D();
+
+	Vector wishdir = wish;
+	if (wishspeed > 0.0f)
+		wishdir /= wishspeed;
+	else
+		wishdir = vec3_origin;
+
+	// Work on XY only; preserve Z in the caller
+	Vector velXY(inOutVel.x, inOutVel.y, 0.0f);
+
+	if (mv->m_bOnGround)
+	{
+		Legacy_ApplyFriction(params, dt, velXY);
+		Legacy_AccelerateGround(params, dt, wishdir, wishspeed, velXY);
+	}
+	else
+	{
+		Legacy_AccelerateAir(params, dt, wishdir, wishspeed, velXY);
+	}
+
+	inOutVel.x = velXY.x;
+	inOutVel.y = velXY.y;
+	// Z left as-is
+}
+
+// --------------------------------------------------------------------------------------
 
 void FASTCALL Detour_ProcessMovement(CCSPlayer_MovementServices *pThis, void *pMove)
 {
@@ -66,7 +166,49 @@ void FASTCALL Detour_ProcessMovement(CCSPlayer_MovementServices *pThis, void *pM
 	player->didTPM = false;
 	player->processingMovement = true;
 
+	// Compute legacy XY velocity candidate before engine runs
+	Vector preVel;
+	player->GetVelocity(&preVel);
+	Vector legacyVelCandidate = preVel;
+
+	if (player->currentMoveData && g_LegacyAccelParams.enable)
+	{
+		ComputeLegacyVelocityStep(pThis, player->currentMoveData, g_LegacyAccelParams, legacyVelCandidate);
+		legacyVelCandidate.z = preVel.z; // preserve Z
+	}
+
+	// Run original engine movement (subtick, gravity, collision, etc.)
 	ProcessMovement(pThis, pMove);
+
+	// Selectively restore legacy XY accel if engine's XY diverges
+	if (player->currentMoveData && g_LegacyAccelParams.enable)
+	{
+		Vector postVel;
+		player->GetVelocity(&postVel);
+
+		Vector legacyXY(legacyVelCandidate.x, legacyVelCandidate.y, 0.0f);
+		Vector postXY(postVel.x, postVel.y, 0.0f);
+
+		float lenLegacy = legacyXY.Length2D();
+		float lenPost   = postXY.Length2D();
+
+		bool diverged = false;
+		if (lenLegacy > 1.0f && lenPost > 1.0f)
+		{
+			Vector nLegacy = legacyXY; if (lenLegacy > 0.0f) nLegacy /= lenLegacy;
+			Vector nPost   = postXY;   if (lenPost   > 0.0f) nPost   /= lenPost;
+			float dot = DotProduct(nLegacy, nPost);
+			diverged = (dot < 0.999f);
+		}
+
+		if (diverged)
+		{
+			Vector merged = postVel;
+			merged.x = legacyVelCandidate.x;
+			merged.y = legacyVelCandidate.y;
+			player->SetVelocity(merged);
+		}
+	}
 
 	if(!player->didTPM)
 		player->lastValidPlane = vec3_origin;
@@ -139,7 +281,6 @@ bool IsValidMovementTrace(trace_t &tr, bbox_t bounds, CTraceFilterPlayerMovement
 
 	return true;
 }
-
 
 #define MAX_BUMPS 4
 #define RAMP_PIERCE_DISTANCE 0.75f
@@ -384,52 +525,8 @@ void TryPlayerMovePost(CCSPlayer_MovementServices *ms, bool *bIsSurfing)
 		player->tpmVelocity.Normalized().Dot(velocity.Normalized()) < RAMP_BUG_THRESHOLD
 		|| (player->tpmVelocity.Length() > 50.0f && velocity.Length() / player->tpmVelocity.Length() < RAMP_BUG_VELOCITY_THRESHOLD);
 
-	// QAngle angles;
-	// player->GetEyeAngles(&angles);
-	// if (angles.x < -15 && bIsSurfing && *bIsSurfing)
-	// {
-	// 	constexpr float DEG2RAD = 3.14159265f / 180.0f;
- //
-	// 	// Compute forward vector inline
-	// 	float cp = std::cos(angles.x * DEG2RAD);
-	// 	float sp = std::sin(angles.x * DEG2RAD);
-	// 	float cy = std::cos(angles.y * DEG2RAD);
-	// 	float sy = std::sin(angles.y * DEG2RAD);
- //
-	// 	// Forward direction
-	// 	float fx = cp * cy;
-	// 	float fy = cp * sy;
-	// 	float fz = -sp;
- //
-	// 	// Example base velocity and boost
-	// 	float speed = std::sqrt(velocity.x * velocity.x +
- //                        velocity.y * velocity.y +
- //                        velocity.z * velocity.z);
-	// 	float boost = 1.005f - 1.0f;  // +.5%
- //
-	// 	// Apply boosted forward velocity inline
-	// 	float vx = fx * speed * boost;
-	// 	float vy = fy * speed * boost;
-	// 	float vz = fz * speed * boost;
-	// 	velocity.x += vx;
-	// 	velocity.y += vy;
-	// 	velocity.z += vz;
- //
-	// 	// Clamp total speed to 4096
-	// 	float newSpeed = std::sqrt(velocity.x * velocity.x +
-	// 							   velocity.y * velocity.y +
-	// 							   velocity.z * velocity.z);
-	// 	if (newSpeed > 4096.0f)
-	// 	{
-	// 		float scale = 4096.0f / newSpeed;
-	// 		velocity.x *= scale;
-	// 		velocity.y *= scale;
-	// 		velocity.z *= scale;
-	// 	}
- //
-	// 	player->SetVelocity(velocity);
-	// }
-	
+	// Optional: commented surfing tweak code block
+
 	if (player->overrideTPM && velocityHeavilyModified && player->tpmOrigin != vec3_invalid && player->tpmVelocity != vec3_invalid)
 	{
 		player->SetOrigin(player->tpmOrigin);
